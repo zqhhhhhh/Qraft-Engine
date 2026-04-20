@@ -7,9 +7,9 @@
 <p align="center">
   <a href="https://www.youtube.com/watch?v=BBjlg-sMpcE"><strong>Introduction Video</strong></a>
   &nbsp;&nbsp;|&nbsp;&nbsp;
-  <a href="https://youtu.be/PLACEHOLDER_GUI_DEMO"><strong>GUI Version Demo</strong></a>
+  <a href="https://youtu.be/6ty8wd_-XEU"><strong>GUI Version Demo</strong></a>
   &nbsp;&nbsp;|&nbsp;&nbsp;
-  <a href="https://qianhui.dev"><strong>Portfolio</strong></a>
+  <a href="https://zqhhhhhh.github.io/zqhhhhhh/#/project"><strong>Portfolio</strong></a>
 </p>
 
 ---
