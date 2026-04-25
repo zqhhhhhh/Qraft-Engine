@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 #include <thread>
 #include <chrono>
@@ -435,19 +436,23 @@ std::shared_ptr<luabridge::LuaRef> ComponentDB::GetComponentType(const std::stri
 }    const std::filesystem::path component_path = std::filesystem::path("resources/component_types") / (component_type + ".lua");
     if (!std::filesystem::exists(component_path))
     {
-        std::cout << "error: failed to locate component " << component_type;
-        exit(0);
+        throw std::runtime_error("error: failed to locate component " + component_type);
     }
     if (luaL_dofile(lua_state, component_path.string().c_str()) != LUA_OK)
     {
-        std::cout << "problem with lua file " << component_path.stem().string();
-        exit(0);
+        const char* lua_err = lua_tostring(lua_state, -1);
+        std::string msg = lua_err ? std::string(lua_err)
+                                  : ("problem with lua file " + component_path.stem().string());
+        lua_pop(lua_state, 1);
+        throw std::runtime_error(msg);
     }
     luabridge::LuaRef component_table = luabridge::getGlobal(lua_state, component_type.c_str());
     if (!component_table.isTable())
     {
-        std::cout << "problem with lua file " << component_path.stem().string();
-        exit(0);
+        throw std::runtime_error(
+            "problem with lua file " + component_path.stem().string() +
+            ": global '" + component_type + "' is not a table — "
+            "make sure the variable name in the file matches the filename");
     }
     auto stored = std::make_shared<luabridge::LuaRef>(std::move(component_table));
     component_types.emplace(component_type, stored);

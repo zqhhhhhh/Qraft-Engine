@@ -486,6 +486,84 @@ namespace
 #endif
     }
 
+    // Copy/convert an audio file into resources/audio/ and return the stem name used by Audio.Play().
+    // Supported engine formats: .wav and .ogg.  Other formats (e.g. .mp3) are converted to .wav via afconvert.
+    std::optional<std::string> ImportAudioFileToProject(const std::filesystem::path& src_path)
+    {
+        if (src_path.empty() || !std::filesystem::exists(src_path) || !src_path.has_stem())
+            return std::nullopt;
+
+        const std::string ext = src_path.has_extension() ? src_path.extension().string() : "";
+        std::string lower_ext = ext;
+        std::transform(lower_ext.begin(), lower_ext.end(), lower_ext.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        std::filesystem::create_directories("resources/audio");
+
+        std::error_code ec;
+
+        if (lower_ext == ".wav" || lower_ext == ".ogg")
+        {
+            // Copy directly — engine already supports these formats
+            const std::filesystem::path dst =
+                std::filesystem::path("resources/audio") / (src_path.stem().string() + lower_ext);
+
+            const std::filesystem::path abs_src = std::filesystem::weakly_canonical(src_path, ec);
+            ec.clear();
+            const std::filesystem::path abs_dst = std::filesystem::weakly_canonical(dst, ec);
+            if (!abs_src.empty() && !abs_dst.empty() && abs_src == abs_dst)
+                return src_path.stem().string();
+
+            std::filesystem::copy_file(src_path, dst, std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) return std::nullopt;
+            return src_path.stem().string();
+        }
+        else
+        {
+            // Convert to .wav using macOS afconvert (handles mp3, aiff, m4a, aac, …)
+            const std::filesystem::path dst =
+                std::filesystem::path("resources/audio") / (src_path.stem().string() + ".wav");
+            std::string cmd = "afconvert -f WAVE -d LEI16 \""
+                + std::filesystem::absolute(src_path).string() + "\" \""
+                + std::filesystem::absolute(dst).string() + "\" 2>/dev/null";
+            if (std::system(cmd.c_str()) == 0)
+                return src_path.stem().string();
+
+            // afconvert failed — fall back to a plain copy so the file at least lands in the project
+            std::filesystem::copy_file(src_path, dst, std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) return std::nullopt;
+            return src_path.stem().string();
+        }
+    }
+
+    // Open a system file-picker filtered to audio files and import the result.
+    std::optional<std::string> PickAudioAndImportToProject()
+    {
+#ifdef __APPLE__
+        const char* pick_cmd =
+            "osascript -e 'set f to choose file with prompt \"Pick an audio file\" "
+            "of type {\"public.audio\", \"public.mp3\", \"org.xiph.ogg-vorbis\"}' "
+            "-e 'POSIX path of f'";
+        FILE* pipe = popen(pick_cmd, "r");
+        if (pipe == nullptr) return std::nullopt;
+
+        std::string selected_path;
+        char buffer[1024];
+        while (fgets(buffer, static_cast<int>(sizeof(buffer)), pipe) != nullptr)
+            selected_path += buffer;
+
+        const int status = pclose(pipe);
+        if (status != 0) return std::nullopt;
+
+        selected_path = TrimString(selected_path);
+        if (selected_path.empty()) return std::nullopt;
+
+        return ImportAudioFileToProject(std::filesystem::path(selected_path));
+#else
+        return std::nullopt;
+#endif
+    }
+
     std::optional<std::string> ChooseDirectoryDialog()
     {
 #ifdef __APPLE__
@@ -1108,8 +1186,10 @@ void SceneEditor::RenderProjectHub()
     const float hub_height = std::min(560.0f, static_cast<float>(last_window_height) - 40.0f);
     ImGui::SetNextWindowPos(ImVec2(static_cast<float>(last_window_width) * 0.5f, static_cast<float>(last_window_height) * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(std::max(360.0f, hub_width), std::max(360.0f, hub_height)), ImGuiCond_Always);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
     ImGui::Begin("Project Hub", nullptr,
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
+    ImGui::PopStyleColor();
 
     ImGui::SetCursorPosX(std::max(0.0f, ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - 28.0f));
     ImGui::SetCursorPosY(std::max(0.0f, ImGui::GetStyle().WindowPadding.y));
@@ -1375,11 +1455,46 @@ void SceneEditor::RefreshLuaScriptChanges()
         return;
     }
 
+    // ── Pre-validate every .lua file with luaL_loadfile (compile-only, no execution).
+    // This catches syntax errors produced by mid-edit autosaves without running
+    // broken code.  If any file is malformed we display the error in the status bar
+    // and skip the reload until the user finishes editing.
+    lua_State* L = ComponentDB::GetLuaState();
+    if (L)
+    {
+        for (const auto& entry : std::filesystem::directory_iterator(script_dir))
+        {
+            if (!entry.is_regular_file() || entry.path().extension() != ".lua")
+                continue;
+
+            if (luaL_loadfile(L, entry.path().string().c_str()) != LUA_OK)
+            {
+                const char* err_msg = lua_tostring(L, -1);
+                saved_message = err_msg ? std::string(err_msg)
+                                        : ("Syntax error in " + entry.path().stem().string());
+                saved_message_frames = 600;
+                lua_pop(L, 1);
+                return;   // wait for the file to be saved in a valid state
+            }
+            lua_pop(L, 1);   // discard compiled chunk — do NOT execute it
+        }
+    }
+
     const std::string scene_name = CurrentSceneName();
     const std::string selected_name = selected_entity ? selected_entity->GetName() : "";
 
     component_db->ClearComponentTypeCache();
-    ReloadScene(scene_name);
+
+    try
+    {
+        ReloadScene(scene_name);
+    }
+    catch (const std::exception& e)
+    {
+        saved_message = std::string("Lua error: ") + e.what();
+        saved_message_frames = 600;
+        return;
+    }
 
     selected_entity.reset();
     if (!selected_name.empty())
@@ -1606,7 +1721,30 @@ bool SceneEditor::EnterPlayMode()
         return false;
     }
 
-    ReloadScene(scene_name);
+    // Always reload component scripts from disk before playing so that any code
+    // the user saved after the last hot-reload poll is picked up immediately.
+    if (component_db != nullptr)
+    {
+        component_db->ClearComponentTypeCache();
+    }
+
+    try
+    {
+        ReloadScene(scene_name);
+    }
+    catch (const std::exception& e)
+    {
+        // Lua error in one of the component scripts — show the message in the
+        // editor status bar and abort play mode rather than crashing.
+        saved_message = std::string("Play error: ") + e.what();
+        saved_message_frames = 600;
+        is_playing = false;
+        RestorePlayModeSceneBackup();
+        if (component_db != nullptr) component_db->ClearComponentTypeCache();
+        ReloadScene(scene_name);   // restore the editor scene (best-effort)
+        return false;
+    }
+
     is_playing = true;
     saved_message = "Play";
     saved_message_frames = 180;
@@ -2039,8 +2177,9 @@ void SceneEditor::RenderHierarchyPanel()
                           cur.begin() + std::min(cur.size(), rename_buf.size() - 1),
                           rename_buf.begin());
             }
-            // Select + Enter → enter rename mode
-            if (is_selected && ImGui::IsKeyPressed(SDL_SCANCODE_RETURN) && !renaming_actor)
+            // Select + Enter → enter rename mode (only when Hierarchy window itself has focus,
+            // so that confirming an InputText in the Inspector doesn't also trigger rename)
+            if (is_selected && ImGui::IsKeyPressed(SDL_SCANCODE_RETURN) && !renaming_actor && ImGui::IsWindowFocused())
             {
                 renaming_actor = actor;
                 std::string cur = actor->GetName();
@@ -2325,6 +2464,20 @@ void SceneEditor::RenderComponentProperties(luabridge::LuaRef& comp_ref, const s
                         }
                     }
                 }
+                else if (prop.key == "clip")
+                {
+                    std::filesystem::path maybe_path(new_val);
+                    if (std::filesystem::exists(maybe_path) && maybe_path.has_extension())
+                    {
+                        std::optional<std::string> imported = ImportAudioFileToProject(maybe_path);
+                        if (imported.has_value())
+                        {
+                            new_val = imported.value();
+                            saved_message = "Imported audio: " + new_val;
+                            saved_message_frames = 180;
+                        }
+                    }
+                }
                 comp_ref[prop.key] = new_val;
                 if (!CurrentSceneName().empty())
                 {
@@ -2352,6 +2505,30 @@ void SceneEditor::RenderComponentProperties(luabridge::LuaRef& comp_ref, const s
                     else
                     {
                         saved_message = "Image import canceled/failed";
+                        saved_message_frames = 180;
+                    }
+                }
+            }
+            else if (prop.key == "clip")
+            {
+                ImGui::SameLine();
+                std::string pick_label = "Pick##" + widget_id;
+                if (ImGui::SmallButton(pick_label.c_str()))
+                {
+                    std::optional<std::string> imported = PickAudioAndImportToProject();
+                    if (imported.has_value())
+                    {
+                        comp_ref[prop.key] = imported.value();
+                        saved_message = "Imported audio: " + imported.value();
+                        saved_message_frames = 180;
+                        if (!CurrentSceneName().empty())
+                        {
+                            SaveScene(CurrentSceneName());
+                        }
+                    }
+                    else
+                    {
+                        saved_message = "Audio import canceled/failed";
                         saved_message_frames = 180;
                     }
                 }
@@ -2963,6 +3140,11 @@ void SceneEditor::AddComponentToActor(std::shared_ptr<Actor> actor, const std::s
             lua_file << BuildComponentTemplate(normalized_type_name);
         }
         lua_file.close();
+
+        // Register with an epoch timestamp so the watcher always treats the next real
+        // mtime as a "change" — this way, even if the user saves edits within the first
+        // watcher poll window, a hot-reload is guaranteed to fire.
+        lua_component_write_times[normalized_type_name] = std::filesystem::file_time_type{};
 
         // Open the newly created script in the default editor
         system(("open \"" + std::filesystem::absolute(component_path).string() + "\"").c_str());

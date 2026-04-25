@@ -583,6 +583,7 @@ void Engine::Update()
     ProcessPendingComponentRemovals();
     ProcessDestroyedActors();
     EventBus::ProcessPendingSubscriptions();
+    Rigidbody::ClearPendingCollisionEvents();
     Rigidbody::StepWorld();
     Rigidbody::DispatchCollisionEvents();
     input.LateUpdate();
